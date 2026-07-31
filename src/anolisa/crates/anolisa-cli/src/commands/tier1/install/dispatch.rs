@@ -438,17 +438,24 @@ pub(crate) fn plan_component(
     let (target, native_package): (ProviderTarget, Option<String>) = match &active_binding {
         Some(binding) => target_for_active_record(binding, &family, args, &component),
         None if family == "raw" => {
+            // The I3 presence probe consults the rpmdb, which only exists
+            // where RPM is the host's package authority; on a deb-family
+            // host (e.g. Ubuntu) the check is vacuous and demanding rpm/dnf
+            // would block every raw install. Skipping yields NotProbed,
+            // which the planner does not read as "present".
             let native_package = match scope {
-                InstallationScope::System => Some(system_probe_package(
-                    args,
-                    &layout,
-                    &env,
-                    &repo_config,
-                    &component,
-                    query,
-                    &command,
-                )?),
-                InstallationScope::User { .. } => None,
+                InstallationScope::System if system_rpm_probe_applies(env.os_id.as_deref()) => {
+                    Some(system_probe_package(
+                        args,
+                        &layout,
+                        &env,
+                        &repo_config,
+                        &component,
+                        query,
+                        &command,
+                    )?)
+                }
+                _ => None,
             };
             (
                 ProviderTarget::Owned {
@@ -873,6 +880,22 @@ fn resolve_owned_artifact(
         },
     )
     .map_err(|err| err.with_command(command))
+}
+
+/// Whether a fresh raw system-scope install must run the system-RPM
+/// presence probe (planner rule I3).
+///
+/// The probe protects unobserved system RPMs, which can only exist where
+/// RPM is the host's package authority. A host that positively identifies
+/// as another package family (deb: Ubuntu, Debian, ...) has no rpmdb to
+/// consult, so the probe is skipped instead of demanding rpm/dnf the
+/// distro does not ship. Rpm-family and unrecognized hosts keep the probe,
+/// so a genuinely rpm-based host with broken tooling still fails closed.
+pub(crate) fn system_rpm_probe_applies(os_id: Option<&str>) -> bool {
+    match os_id.and_then(anolisa_env::pkg_base_from_id) {
+        Some(base) => base == "rpm",
+        None => true,
+    }
 }
 
 /// RPM package name a raw install probes for the planner's I3 rule.
@@ -1747,6 +1770,20 @@ mod tests {
         fn finish(&mut self) {
             self.finished.set(true);
         }
+    }
+
+    #[test]
+    fn system_rpm_probe_follows_host_package_family() {
+        // rpm-family hosts must keep the I3 probe.
+        assert!(system_rpm_probe_applies(Some("alinux")));
+        assert!(system_rpm_probe_applies(Some("anolis")));
+        assert!(system_rpm_probe_applies(Some("fedora")));
+        // deb-family hosts have no rpmdb; the probe is vacuous there.
+        assert!(!system_rpm_probe_applies(Some("ubuntu")));
+        assert!(!system_rpm_probe_applies(Some("debian")));
+        // Unrecognized or undetected hosts fail closed and keep the probe.
+        assert!(system_rpm_probe_applies(Some("opensuse-leap")));
+        assert!(system_rpm_probe_applies(None));
     }
 
     #[test]

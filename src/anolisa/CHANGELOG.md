@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `anolisa install` no longer refuses raw-backend installs on hosts without
+  RPM tooling (e.g. Ubuntu/Debian): the system-RPM presence check is skipped
+  where RPM is not the host's package authority, instead of failing with
+  "rpm not found on PATH". Rpm-family hosts keep the check unchanged.
+
 ## [0.2.15] - 2026-07-30
 
 ### Added

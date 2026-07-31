@@ -664,7 +664,13 @@ fn delegated_install_requires_configured_rpm_backend() {
 fn system_install_without_rpm_tooling_warns_and_exits() {
     // System scope, fresh state: with rpm/dnf absent the probe cannot prove
     // the component is not an unobserved system RPM (I3), so install refuses
-    // rather than silently placing raw files over one.
+    // rather than silently placing raw files over one. Only hosts whose
+    // package authority is RPM run the probe; a deb-family host asserts the
+    // inverse in `deb_host_missing_rpm_tooling_does_not_block_raw_install`.
+    let host_os_id = anolisa_env::EnvService::detect().os_id;
+    if !system_rpm_probe_applies(host_os_id.as_deref()) {
+        return;
+    }
     let (_tmp, ctx) = system_ctx_with_raw_repo(false);
     let q = FakeQuery {
         command_missing: true,
@@ -684,6 +690,38 @@ fn system_install_without_rpm_tooling_warns_and_exits() {
             .find(ObjectKind::Component, "copilot-shell")
             .is_none(),
         "warn-and-exit must not write any state"
+    );
+}
+
+#[test]
+fn deb_host_missing_rpm_tooling_does_not_block_raw_install() {
+    // A deb-family host (e.g. Ubuntu) has no rpmdb, so the I3 presence
+    // probe is vacuous: missing rpm/dnf must not block a raw install.
+    // Runs only on such hosts; rpm-authority hosts assert the inverse in
+    // `system_install_without_rpm_tooling_warns_and_exits`.
+    let host_os_id = anolisa_env::EnvService::detect().os_id;
+    if system_rpm_probe_applies(host_os_id.as_deref()) {
+        return;
+    }
+    let tmp = tempdir().expect("tmpdir");
+    let prefix = tmp.path().join("sys");
+    let repo_url = write_local_repo(&tmp.path().join("repo"));
+    let mut a = args("agentsight");
+    a.repo = Some(repo_url);
+    let ctx = ctx_with_prefix(false, Some(prefix));
+    let q = FakeQuery {
+        command_missing: true,
+        ..Default::default()
+    };
+
+    handle_one_with_query("agentsight".to_string(), a, &ctx, &q)
+        .expect("raw install must not require rpm tooling on a non-rpm host");
+
+    assert!(
+        load_store(&ctx)
+            .find(ObjectKind::Component, "agentsight")
+            .is_some(),
+        "raw install must be recorded"
     );
 }
 
