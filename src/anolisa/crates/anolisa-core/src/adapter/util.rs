@@ -2,51 +2,71 @@
 //! drivers.
 //!
 //! These never spawn a process or mutate the filesystem beyond reading for
-//! a digest, so they are safe to call from `plan`/`status`/`prepare` paths.
-//! The Cosh/Codex/Claude Code drivers share them here rather than each
-//! re-declaring the same digest/timestamp/formatting logic.
+//! a comparison, so they are safe to call from `plan`/`status`/`prepare`
+//! paths. The Cosh/Codex/Claude Code drivers share them here rather than
+//! each re-declaring the same comparison/timestamp/formatting logic.
 
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use super::driver::{CliOutput, ConditionStatus, FrameworkCommand};
 
-/// SHA-256 digest of a directory tree, stable across runs: files are hashed
-/// in sorted relative-path order as `path\0len\0bytes`. Returns `None` on
-/// any IO error so callers fall back to `Unknown` rather than a wrong
-/// verdict.
-pub(crate) fn digest_tree(root: &Path) -> Option<String> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    collect_files(root, &mut files).ok()?;
-    files.sort();
-    let mut hasher = Sha256::new();
-    for path in &files {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        let bytes = std::fs::read(path).ok()?;
-        hasher.update(rel.to_string_lossy().as_bytes());
-        hasher.update([0u8]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update([0u8]);
-        hasher.update(&bytes);
+/// Compare a delivered source tree against an installed copy with subset
+/// semantics: every regular file under `source` must have a byte-identical
+/// counterpart at the same relative path under `copy`. Extra files in the
+/// copy are ignored — the copy is the executed artifact and legitimately
+/// accretes state the delivery never shipped (runtime-derived files such
+/// as Python's `__pycache__`, ownership markers).
+///
+/// Returns the sorted relative paths that are missing from or differ in
+/// the copy (empty means the copy matches the delivery). Returns `Err`
+/// when `source` cannot be walked or read, so callers report `Unknown`
+/// rather than a wrong verdict. Symlinked entries compare their referent
+/// bytes (reads follow links); directories contribute only their files.
+pub(crate) fn copy_divergence(source: &Path, copy: &Path) -> std::io::Result<Vec<PathBuf>> {
+    fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                collect_files(&path, out)?;
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(())
     }
-    Some(format!("sha256:{:x}", hasher.finalize()))
-}
 
-/// Recursively collect regular-file paths under `dir`. Symlinks are not
-/// followed into directories (their link path is recorded as a file).
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
+    let mut files = Vec::new();
+    collect_files(source, &mut files)?;
+    files.sort();
+    let mut diverged = Vec::new();
+    for path in files {
+        let rel = path.strip_prefix(source).unwrap_or(&path).to_path_buf();
+        let delivered = std::fs::read(&path)?;
+        // A missing or unreadable counterpart is divergence, not Unknown:
+        // the delivery side read fine, so the verdict "the copy does not
+        // carry this delivered file" is decidable.
+        match std::fs::read(copy.join(&rel)) {
+            Ok(installed) if installed == delivered => {}
+            _ => diverged.push(rel),
         }
     }
-    Ok(())
+    Ok(diverged)
+}
+
+/// Human-readable list of diverged relative paths for a condition reason:
+/// up to three named, the rest counted.
+pub(crate) fn display_paths(paths: &[PathBuf]) -> String {
+    let named: Vec<String> = paths
+        .iter()
+        .take(3)
+        .map(|p| p.display().to_string())
+        .collect();
+    let mut out = named.join(", ");
+    if paths.len() > 3 {
+        out.push_str(&format!(" and {} more", paths.len() - 3));
+    }
+    out
 }
 
 /// ISO 8601 UTC timestamp, second precision.

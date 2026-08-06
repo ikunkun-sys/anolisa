@@ -110,9 +110,6 @@ impl DriverCtx<'_> {
 pub struct AdapterBundle {
     /// Resource root the bundle was read from.
     pub resource_root: PathBuf,
-    /// Digest of the resource tree, for drift/upgrade detection. `None`
-    /// when the driver declined to compute one.
-    pub digest: Option<String>,
     /// Framework-native plugin id resolved from the bundle (or the
     /// manifest-declared fallback).
     pub plugin_id: Option<String>,
@@ -265,8 +262,14 @@ pub enum AdapterConditionKind {
     SourceAvailable,
     /// The framework itself is detectable on the host.
     FrameworkDetected,
-    /// The installed resource bundle still matches the enable-time digest.
-    ResourceBundleMatches,
+    /// The source component's declared version still matches the version
+    /// recorded at enable time. `False` means the component was updated
+    /// (or downgraded) after enable, so the framework-side state no longer
+    /// corresponds to the component's current adapter resources until
+    /// re-enable. Manager-level: computed from the receipt and the resolved
+    /// contract, never by inspecting the resource tree — files a runtime
+    /// derives inside the resource root (e.g. `__pycache__`) are not drift.
+    SourceVersionMatches,
     /// The plugin is still present in the framework registry.
     PluginRegistered,
     /// The framework reports the plugin's declared resources as loaded.

@@ -469,12 +469,18 @@ pub(crate) fn adapter_actions_after_update(
 }
 
 fn receipt_adapter_actions(store: &StateStore, component: &str) -> Vec<AdapterAction> {
-    claim::stale_enabled_claims(&store.adapter_claims, component)
+    // The update just wrote the component's new version into state, so the
+    // store is the authority for "current"; receipts recorded against an
+    // older version are the ones the update left stale.
+    let current_version = store
+        .find(anolisa_core::state::ObjectKind::Component, component)
+        .and_then(|installation| installation.binding.version());
+    claim::stale_enabled_claims(&store.adapter_claims, component, current_version)
         .into_iter()
         .map(|receipt| AdapterAction {
             component: receipt.component.clone(),
             framework: receipt.framework.clone(),
-            reason: claim::BUNDLE_CHANGED_REASON.to_string(),
+            reason: claim::COMPONENT_UPDATED_REASON.to_string(),
             command: format!(
                 "anolisa adapter enable {} {}",
                 receipt.component, receipt.framework
@@ -2135,40 +2141,6 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     use anolisa_platform::pkg_query::PackageVersion;
-
-    /// Reproduce the persisted receipt digest without exposing the core
-    /// implementation as public API solely for cross-crate test fixtures.
-    pub(crate) fn receipt_digest(root: &Path) -> Option<String> {
-        use sha2::{Digest, Sha256};
-
-        fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
-            for entry in std::fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if entry.file_type()?.is_dir() {
-                    collect_files(&path, files)?;
-                } else {
-                    files.push(path);
-                }
-            }
-            Ok(())
-        }
-
-        let mut files = Vec::new();
-        collect_files(root, &mut files).ok()?;
-        files.sort();
-        let mut hasher = Sha256::new();
-        for path in files {
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            let bytes = std::fs::read(&path).ok()?;
-            hasher.update(relative.to_string_lossy().as_bytes());
-            hasher.update([0]);
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update([0]);
-            hasher.update(bytes);
-        }
-        Some(format!("sha256:{:x}", hasher.finalize()))
-    }
 
     #[cfg(unix)]
     #[test]
@@ -4684,12 +4656,13 @@ packages = { rpm = "absent-tool", deb = "absent-tool" }
     };
 
     /// An enabled receipt for `(component, framework)` pointing at
-    /// `resource_root`, carrying `bundle_digest` as its enable-time digest.
+    /// `resource_root`, carrying `component_version` as its enable-time
+    /// component version.
     pub(crate) fn enabled_claim(
         component: &str,
         framework: &str,
         resource_root: &Path,
-        bundle_digest: Option<&str>,
+        component_version: Option<&str>,
     ) -> AdapterClaim {
         AdapterClaim {
             claim_schema: CLAIM_SCHEMA_VERSION,
@@ -4699,7 +4672,8 @@ packages = { rpm = "absent-tool", deb = "absent-tool" }
             adapter_type: Some("extension".to_string()),
             enabled_at: "2026-07-01T00:00:00Z".to_string(),
             resource_root: resource_root.to_path_buf(),
-            bundle_digest: bundle_digest.map(str::to_string),
+            bundle_digest: None,
+            component_version: component_version.map(str::to_string),
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -4724,7 +4698,7 @@ packages = { rpm = "absent-tool", deb = "absent-tool" }
         AdapterAction {
             component: component.to_string(),
             framework: framework.to_string(),
-            reason: "resource bundle changed since enable".to_string(),
+            reason: "component updated since enable".to_string(),
             command: format!("anolisa adapter enable {component} {framework}"),
         }
     }
@@ -4780,7 +4754,7 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
     }
 
     /// Seed the adapter bundle an earlier version shipped plus an enabled
-    /// receipt whose enable-time digest matches it; returns the bundle root.
+    /// receipt recorded against that version; returns the bundle root.
     fn seed_bundle_and_claim(ctx: &CliContext, component: &str, content: &[u8]) -> PathBuf {
         let layout = common::resolve_layout(ctx);
         let manifest_path =
@@ -4799,18 +4773,17 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
             .join("openclaw");
         std::fs::create_dir_all(&bundle_root).expect("bundle root");
         std::fs::write(bundle_root.join("plugin.json"), content).expect("bundle file");
-        let digest = receipt_digest(&bundle_root).expect("enable-time digest");
         seed_claim(
             ctx,
-            enabled_claim(component, "openclaw", &bundle_root, Some(&digest)),
+            enabled_claim(component, "openclaw", &bundle_root, Some("0.1.0")),
         );
         bundle_root
     }
 
     /// Seed a raw-installed component that ships an adapter bundle: the
     /// record owns the bundle file (as a real install with `[[adapters]]`
-    /// would), and an enabled receipt carries the enable-time digest of the
-    /// bundle root. Returns the bundle root.
+    /// would), and an enabled receipt carries the enable-time component
+    /// version. Returns the bundle root.
     fn seed_raw_component_with_bundle(
         ctx: &CliContext,
         component: &str,
@@ -4856,15 +4829,14 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
         });
         state.save(&state_path).expect("save state");
 
-        let digest = receipt_digest(&bundle_root).expect("enable-time digest");
         seed_claim(
             ctx,
-            enabled_claim(component, "openclaw", &bundle_root, Some(&digest)),
+            enabled_claim(component, "openclaw", &bundle_root, Some(version)),
         );
         bundle_root
     }
 
-    /// System updates must never inspect receipt-selected resource paths.
+    /// System updates must never consult receipt state.
     #[test]
     fn system_update_actions_ignore_receipts() {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -4872,21 +4844,23 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
         let bundle_root = tmp.path().join("receipt-controlled");
         std::fs::create_dir_all(&bundle_root).expect("bundle root");
         std::fs::write(bundle_root.join("plugin.json"), b"v1").expect("bundle file");
-        let digest = receipt_digest(&bundle_root).expect("enable-time digest");
 
-        let mut store = StateStore::empty();
+        // A store whose component moved past the receipt's enable-time
+        // version: the user-mode receipt path WOULD report this stale, so
+        // an empty result proves the system path never consulted it.
+        seed_installed_raw(&c, "tokenless", "0.2.0", b"current binary\n");
+        let mut store = load_store(&c);
         store.upsert_adapter_claim(enabled_claim(
             "tokenless",
             "openclaw",
             &bundle_root,
-            Some(&digest),
+            Some("0.1.0"),
         ));
-        std::fs::write(bundle_root.join("plugin.json"), b"v2").expect("updated bundle");
 
         assert!(
             adapter_actions_after_update(&c, &store, "tokenless", &AdapterBundleSnapshot::new())
                 .is_empty(),
-            "system mode must ignore receipt-controlled bundle paths"
+            "system mode must ignore receipt state"
         );
     }
 
@@ -5011,15 +4985,10 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
         let bundle_root = layout.datadir.join("adapters/foo/openclaw");
         std::fs::create_dir_all(&bundle_root).expect("bundle root");
         std::fs::write(bundle_root.join("plugin.json"), b"v2").expect("bundle file");
-        // A receipt stale from an earlier drift — not from this update.
+        // A receipt stale from an earlier update — not from this one.
         seed_claim(
             &c,
-            enabled_claim(
-                "foo",
-                "openclaw",
-                &bundle_root,
-                Some("sha256:stale-enable-time"),
-            ),
+            enabled_claim("foo", "openclaw", &bundle_root, Some("0.1.0")),
         );
         publish_raw_repo(
             &tmp.path().join("repo"),
@@ -5051,12 +5020,7 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
         let bundle_root = layout.datadir.join("adapters/foo/openclaw");
         std::fs::create_dir_all(&bundle_root).expect("bundle root");
         std::fs::write(bundle_root.join("plugin.json"), b"v1").expect("bundle file");
-        let receipt = enabled_claim(
-            "foo",
-            "openclaw",
-            &bundle_root,
-            Some("sha256:stale-enable-time"),
-        );
+        let receipt = enabled_claim("foo", "openclaw", &bundle_root, Some("0.1.0"));
         seed_claim(&c, receipt.clone());
         publish_raw_repo(
             &tmp.path().join("repo"),
@@ -5079,19 +5043,16 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
         );
     }
 
-    /// A successful update never rewrites the enable-time digest: the
-    /// framework side was not reapplied, so the receipt must stay stale
-    /// until an explicit `adapter enable`.
+    /// A successful update never rewrites the enable-time component
+    /// version: the framework side was not reapplied, so the receipt must
+    /// stay stale until an explicit `adapter enable`.
     #[test]
     fn successful_update_leaves_the_receipt_untouched() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let c = ctx(tmp.path().join("sys"), InstallMode::System, false);
         let bundle_root =
             seed_raw_component_with_bundle(&c, "foo", "0.1.0", b"old v1 binary\n", b"v1");
-        let receipt = {
-            let digest = receipt_digest(&bundle_root).expect("enable-time digest");
-            enabled_claim("foo", "openclaw", &bundle_root, Some(&digest))
-        };
+        let receipt = enabled_claim("foo", "openclaw", &bundle_root, Some("0.1.0"));
         publish_raw_repo(
             &tmp.path().join("repo"),
             &common::resolve_layout(&c),
@@ -5178,12 +5139,7 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
         std::fs::write(bundle_root.join("plugin.json"), b"v1").expect("bundle file");
         seed_claim(
             &c,
-            enabled_claim(
-                "copilot-shell",
-                "openclaw",
-                &bundle_root,
-                Some("sha256:stale-enable-time"),
-            ),
+            enabled_claim("copilot-shell", "openclaw", &bundle_root, Some("0.9.0")),
         );
         // upgrade_to is None => dnf update is a no-op; EVR stays the same.
         let rpm = FakeRpm::new(
@@ -5223,7 +5179,7 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
             serde_json::json!([{
                 "component": "foo",
                 "framework": "openclaw",
-                "reason": "resource bundle changed since enable",
+                "reason": "component updated since enable",
                 "command": "anolisa adapter enable foo openclaw",
             }]),
             "{json}"

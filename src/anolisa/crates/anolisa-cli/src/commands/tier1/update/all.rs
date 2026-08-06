@@ -1709,7 +1709,7 @@ mod tests {
             adapter_actions: vec![AdapterAction {
                 component: "cosh".to_string(),
                 framework: "openclaw".to_string(),
-                reason: anolisa_core::adapter::claim::BUNDLE_CHANGED_REASON.to_string(),
+                reason: anolisa_core::adapter::claim::COMPONENT_UPDATED_REASON.to_string(),
                 command: "anolisa adapter enable cosh openclaw".to_string(),
             }],
         };
@@ -1721,7 +1721,7 @@ mod tests {
             serde_json::json!([{
                 "component": "cosh",
                 "framework": "openclaw",
-                "reason": "resource bundle changed since enable",
+                "reason": "component updated since enable",
                 "command": "anolisa adapter enable cosh openclaw",
             }]),
             "each batch item carries its own adapter actions (issue #1885): {json}"

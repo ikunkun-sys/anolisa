@@ -390,6 +390,131 @@ fn cosh_enable_status_disable_touches_only_extension_dir() {
     );
 }
 
+/// Cosh executes the copied extension, so runtime-derived files
+/// (`__pycache__` from a hook run, markers) accrete in the *copy*. The
+/// copy-vs-source subset check must ignore them: extras in the copy are
+/// not divergence.
+#[test]
+fn cosh_status_ignores_runtime_outputs_in_the_executed_copy() {
+    let guard = EnvGuard::acquire();
+    let world = stage(
+        "cosh",
+        "extension",
+        "{datadir}/adapters/{component}/common/",
+        stage_cosh_bundle,
+    );
+    let cosh_home = world.prefix.join("cosh-home");
+    std::fs::create_dir_all(&cosh_home).expect("cosh home");
+    guard.set("COSH_HOME", &cosh_home);
+
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some("cosh"), false)
+        .expect("enable");
+    let status = manager.status(Some(COMPONENT)).expect("status");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+
+    // A hook run writes bytecode cache into the executed copy.
+    let pycache = cosh_home
+        .join("extensions")
+        .join(COMPONENT)
+        .join("hooks")
+        .join("__pycache__");
+    std::fs::create_dir_all(&pycache).expect("pycache dir");
+    std::fs::write(pycache.join("run_hook.cpython-311.pyc"), b"bytecode").expect("pyc");
+
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status after pycache");
+    assert_eq!(
+        status.entries[0].report.summary,
+        AdapterSummary::Healthy,
+        "runtime-derived files in the copy must not degrade the adapter"
+    );
+    assert!(
+        status.entries[0]
+            .report
+            .conditions
+            .iter()
+            .any(|c| c.kind == AdapterConditionKind::TreePresent
+                && c.status == ConditionStatus::True),
+        "the tree condition must stay True"
+    );
+}
+
+/// A same-version content change must stay detectable for copy-mode
+/// adapters (#2252's expected behavior, review follow-up on the version
+/// staleness redesign): if the delivered source moves on while the copy
+/// keeps running old files, status degrades and re-enable reconciles.
+/// Tampering with a delivered file inside the copy is the same divergence
+/// seen from the other side.
+#[test]
+fn cosh_status_degrades_when_copied_extension_diverges_from_source() {
+    let guard = EnvGuard::acquire();
+    let world = stage(
+        "cosh",
+        "extension",
+        "{datadir}/adapters/{component}/common/",
+        stage_cosh_bundle,
+    );
+    let cosh_home = world.prefix.join("cosh-home");
+    std::fs::create_dir_all(&cosh_home).expect("cosh home");
+    guard.set("COSH_HOME", &cosh_home);
+
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some("cosh"), false)
+        .expect("enable");
+
+    // A same-version re-release replaces a hook in the source; the copy
+    // still holds the old bytes.
+    let source_hook = world.resource_root.join("hooks").join("run-hook.sh");
+    std::fs::write(&source_hook, b"#!/bin/sh\necho patched\n").expect("patch source hook");
+
+    let status = manager.status(Some(COMPONENT)).expect("status");
+    assert_eq!(
+        status.entries[0].report.summary,
+        AdapterSummary::Degraded,
+        "a copy lagging the delivered source must degrade"
+    );
+    let tree = status.entries[0]
+        .report
+        .conditions
+        .iter()
+        .find(|c| c.kind == AdapterConditionKind::TreePresent)
+        .expect("tree condition present");
+    assert_eq!(tree.status, ConditionStatus::False);
+    assert!(
+        tree.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("hooks/run-hook.sh") && r.contains("re-enable")),
+        "reason must name the diverged file and the recovery: {:?}",
+        tree.reason
+    );
+
+    // Re-enable recopies the bundle and clears the divergence.
+    manager
+        .enable(COMPONENT, Some("cosh"), false)
+        .expect("re-enable");
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status after re-enable");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+
+    // Tampering with a delivered file inside the executed copy is also
+    // divergence — the direction the pre-#2276 source digest never saw.
+    let copied_hook = cosh_home
+        .join("extensions")
+        .join(COMPONENT)
+        .join("hooks")
+        .join("run-hook.sh");
+    std::fs::write(&copied_hook, b"#!/bin/sh\necho tampered\n").expect("tamper copy");
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status after tamper");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Degraded);
+}
+
 #[test]
 fn cosh_dry_run_enable_writes_nothing() {
     let guard = EnvGuard::acquire();
@@ -775,16 +900,16 @@ resource_root = "{root_b}/"
         AdapterSummary::Degraded,
         "a receipt pointing at a vanished root must not report Healthy"
     );
-    let bundle = status.entries[0]
+    let freshness = status.entries[0]
         .report
         .conditions
         .iter()
-        .find(|c| c.kind == AdapterConditionKind::ResourceBundleMatches)
-        .expect("bundle condition present");
-    assert_ne!(
-        bundle.status,
-        ConditionStatus::True,
-        "vanished enable-time root must not verify as matching"
+        .find(|c| c.kind == AdapterConditionKind::SourceVersionMatches)
+        .expect("source version condition present");
+    assert_eq!(
+        freshness.status,
+        ConditionStatus::False,
+        "the receipt was enabled against 0.6.0 while the contract now declares 0.7.0"
     );
 
     // re-enable migrates the marketplace symlink to root B.
@@ -817,6 +942,269 @@ resource_root = "{root_b}/"
         .expect("disable");
     assert!(disabled.claim_removed);
     assert!(!marketplace_root.exists());
+}
+
+/// An out-of-band package upgrade (dnf-style) rewrites the datadir
+/// contract without refreshing the state snapshot. Version staleness must
+/// follow the delivery contract, not the stale snapshot cache.
+#[test]
+fn codex_status_detects_out_of_band_contract_version_change() {
+    let guard = EnvGuard::acquire();
+    let world = stage_rpm_backend(
+        "codex",
+        "plugin",
+        "{datadir}/adapters/{component}/codex/",
+        stage_codex_bundle,
+    );
+    let fake = write_fake_codex(&world.prefix);
+    let (_log, _marketplace_root) = apply_codex_env(&guard, &world, &fake);
+
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some("codex"), false)
+        .expect("enable");
+
+    // dnf rewrites the datadir contract in place (same resource root, new
+    // version); the state snapshot keeps the enable-time 0.6.0 contract.
+    let contract = format!(
+        r#"[component]
+name = "{COMPONENT}"
+version = "0.7.0"
+
+[component.layout]
+modes = ["system"]
+
+[[adapters]]
+framework = "codex"
+adapter_type = "plugin"
+plugin_id = "{COMPONENT}"
+dest = "{{datadir}}/adapters/{{component}}/codex/"
+
+[adapters.backends.rpm]
+resource_root = "{rpm_root}/"
+"#,
+        rpm_root = world.resource_root.display(),
+    );
+    std::fs::write(
+        world
+            .layout
+            .datadir
+            .join("components")
+            .join(COMPONENT)
+            .join("component.toml"),
+        contract,
+    )
+    .expect("out-of-band contract rewrite");
+
+    let status = manager.status(Some(COMPONENT)).expect("status");
+    assert_eq!(status.entries.len(), 1);
+    assert_eq!(
+        status.entries[0].report.summary,
+        AdapterSummary::Degraded,
+        "an out-of-band component upgrade must degrade the receipt"
+    );
+    let freshness = status.entries[0]
+        .report
+        .conditions
+        .iter()
+        .find(|c| c.kind == AdapterConditionKind::SourceVersionMatches)
+        .expect("source version condition present");
+    assert_eq!(freshness.status, ConditionStatus::False);
+    assert!(
+        freshness
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("0.6.0 -> 0.7.0")),
+        "reason must name both versions: {:?}",
+        freshness.reason
+    );
+}
+
+/// Regression pin for #2252 in its original link-mode shape: codex (like
+/// qwencode) executes the resource root in place, so a hook run writes
+/// `__pycache__` into the very tree the old digest sealed. Status must
+/// stay Healthy — link-mode staleness is decided by the component
+/// version, never by re-inspecting the tree.
+#[test]
+fn codex_status_stays_healthy_when_runtime_writes_into_resource_root() {
+    let guard = EnvGuard::acquire();
+    let world = stage(
+        "codex",
+        "plugin",
+        "{datadir}/adapters/{component}/codex/",
+        stage_codex_bundle,
+    );
+    let fake = write_fake_codex(&world.prefix);
+    let (_log, _marketplace_root) = apply_codex_env(&guard, &world, &fake);
+
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some("codex"), false)
+        .expect("enable");
+    let status = manager.status(Some(COMPONENT)).expect("status");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+
+    // A hook run writes bytecode cache into the in-place-executed root.
+    let pycache = world.resource_root.join("hooks").join("__pycache__");
+    std::fs::create_dir_all(&pycache).expect("pycache dir");
+    std::fs::write(pycache.join("hook_config.cpython-311.pyc"), b"bytecode").expect("pyc");
+
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status after pycache");
+    assert_eq!(
+        status.entries[0].report.summary,
+        AdapterSummary::Healthy,
+        "runtime-derived files in a link-mode resource root must not degrade the adapter"
+    );
+    assert!(
+        status.entries[0]
+            .report
+            .conditions
+            .iter()
+            .any(|c| c.kind == AdapterConditionKind::SourceVersionMatches
+                && c.status == ConditionStatus::True),
+        "the version condition must stay True"
+    );
+}
+
+/// A stale leftover contract in the local datadir (searched before the
+/// packaged datadir) must not mask an out-of-band update of the packaged
+/// contract the component actually installs from: the version probe
+/// follows the snapshot's provenance to the packaged root.
+#[test]
+fn codex_out_of_band_change_detected_behind_stale_local_contract() {
+    use anolisa_core::adapter::contract::{
+        ContractProvenance, ContractSourceKind, write_snapshot_provenance,
+    };
+
+    let guard = EnvGuard::acquire();
+    let root = tempfile::tempdir().expect("tempdir");
+    let prefix = root.path().to_path_buf();
+    let layout = FsLayout::system(Some(prefix.clone()));
+    let user_home = prefix.join("home");
+    std::fs::create_dir_all(&user_home).expect("home");
+
+    let resource_root = prefix.join("opt").join("tokenless-plugin");
+    std::fs::create_dir_all(&resource_root).expect("rpm root");
+    stage_codex_bundle(&resource_root);
+
+    let state_path = layout.state_dir.join("installed.toml");
+    std::fs::create_dir_all(state_path.parent().unwrap()).expect("state dir");
+    std::fs::write(
+        &state_path,
+        format!(
+            r#"schema_version = 2
+updated_at = "2026-07-04T00:00:00Z"
+install_mode = "system"
+prefix = "{prefix}"
+anolisa_version = "0.1.20"
+
+[[objects]]
+kind = "component"
+name = "{COMPONENT}"
+version = "0.6.0"
+status = "adopted"
+install_backend = "rpm"
+ownership = "rpm_observed"
+managed = false
+adopted = true
+installed_at = "2026-07-04T00:00:00Z"
+"#,
+            prefix = prefix.display(),
+        ),
+    )
+    .expect("seed state");
+
+    let rpm_root = resource_root.display().to_string();
+    let contract = move |version: &str| {
+        format!(
+            r#"[component]
+name = "{COMPONENT}"
+version = "{version}"
+
+[component.layout]
+modes = ["system"]
+
+[[adapters]]
+framework = "codex"
+adapter_type = "plugin"
+plugin_id = "{COMPONENT}"
+dest = "{{datadir}}/adapters/{{component}}/codex/"
+
+[adapters.backends.rpm]
+resource_root = "{rpm_root}/"
+"#
+        )
+    };
+
+    let packaged_datadir = prefix.join("pkg").join("usr").join("share").join("anolisa");
+    let snapshot_path = layout
+        .state_dir
+        .join("component-manifests")
+        .join(COMPONENT)
+        .join("component.toml");
+    let local_contract = layout
+        .datadir
+        .join("components")
+        .join(COMPONENT)
+        .join("component.toml");
+    let packaged_contract = packaged_datadir
+        .join("components")
+        .join(COMPONENT)
+        .join("component.toml");
+    for path in [&snapshot_path, &local_contract, &packaged_contract] {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("contract dir");
+        std::fs::write(path, contract("0.6.0")).expect("seed contract");
+    }
+    // The snapshot was taken from the packaged contract; the local datadir
+    // copy is a stale leftover of an earlier install.
+    write_snapshot_provenance(
+        &snapshot_path,
+        &ContractProvenance {
+            schema_version: 1,
+            source_kind: ContractSourceKind::Datadir,
+            source_path: packaged_contract.clone(),
+            datadir_root: packaged_datadir.clone(),
+        },
+    )
+    .expect("provenance sidecar");
+
+    let fake = write_fake_codex(&prefix);
+    let world = World {
+        _root: root,
+        prefix,
+        layout,
+        user_home,
+        resource_root,
+    };
+    let (_log, _marketplace_root) = apply_codex_env(&guard, &world, &fake);
+
+    let mut manager = world.manager();
+    manager.push_primary_datadir_root(packaged_datadir);
+    manager
+        .enable(COMPONENT, Some("codex"), false)
+        .expect("enable");
+
+    // dnf-style out-of-band upgrade: only the packaged contract moves; the
+    // stale local contract and the snapshot keep 0.6.0.
+    std::fs::write(&packaged_contract, contract("0.7.0")).expect("out-of-band update");
+
+    let status = manager.status(Some(COMPONENT)).expect("status");
+    assert_eq!(status.entries.len(), 1);
+    let freshness = status.entries[0]
+        .report
+        .conditions
+        .iter()
+        .find(|c| c.kind == AdapterConditionKind::SourceVersionMatches)
+        .expect("source version condition present");
+    assert_eq!(
+        freshness.status,
+        ConditionStatus::False,
+        "the stale local contract must not mask the packaged update: {:?}",
+        freshness.reason
+    );
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Degraded);
 }
 
 #[test]

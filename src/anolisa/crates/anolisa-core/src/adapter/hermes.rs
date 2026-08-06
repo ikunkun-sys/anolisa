@@ -18,8 +18,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
-
 use super::AdapterError;
 use super::claim::{
     AdapterClaim, CLAIM_SCHEMA_VERSION, ClaimResource, ClaimResourceKind, ClaimStatus,
@@ -30,6 +28,7 @@ use super::driver::{
     ClaimResourceRef, ConditionStatus, DetectResult, DisableReport, DriverCtx, DriverPlan,
     FrameworkCommand, FrameworkDriver, HostEnv, PreparedEnable, find_binary_in_path,
 };
+use super::util::{copy_divergence, display_paths};
 
 /// Default timeout for a Hermes CLI invocation.
 const CLI_TIMEOUT: Duration = Duration::from_secs(60);
@@ -123,7 +122,6 @@ impl FrameworkDriver for HermesDriver {
 
         Ok(AdapterBundle {
             resource_root: root.clone(),
-            digest: digest_tree(root),
             plugin_id,
         })
     }
@@ -219,7 +217,8 @@ impl FrameworkDriver for HermesDriver {
                 adapter_type: ctx.adapter_type.clone(),
                 enabled_at: now_iso8601(),
                 resource_root: bundle.resource_root.clone(),
-                bundle_digest: bundle.digest.clone(),
+                bundle_digest: None,
+                component_version: None,
                 driver_schema: DRIVER_SCHEMA_VERSION,
                 status: ClaimStatus::Enabled,
                 notices: Vec::new(),
@@ -298,8 +297,52 @@ impl FrameworkDriver for HermesDriver {
             resource: None,
         });
 
-        // 2. Resource bundle still matches the enable-time digest?
-        conditions.push(self.bundle_match_condition(claim));
+        // 2. Copied plugin tree still matching the delivered source? Hermes
+        //    executes the copy under its home, not the resource root, so a
+        //    copy lagging a same-version source update (or edited in place)
+        //    is degraded even though every file "exists". Extra files in
+        //    the copy are ignored: runtime-derived state legitimately
+        //    accretes there. Skill-only receipts deliver no plugin tree, so
+        //    the check is vacuously true for them.
+        let tree_status = if claim.is_skill_bundle() {
+            ConditionStatus::True
+        } else {
+            let (status, reason) = match claim_plugin_dir(claim) {
+                Some(dir) if !dir.is_dir() => (
+                    ConditionStatus::False,
+                    Some("hermes plugin directory missing".to_string()),
+                ),
+                Some(dir) => match copy_divergence(&ctx.resource_root, &dir) {
+                    Ok(diverged) if diverged.is_empty() => (ConditionStatus::True, None),
+                    Ok(diverged) => (
+                        ConditionStatus::False,
+                        Some(format!(
+                            "copied plugin differs from the delivered source ({}); re-enable to refresh",
+                            display_paths(&diverged),
+                        )),
+                    ),
+                    Err(err) => (
+                        ConditionStatus::Unknown,
+                        Some(format!(
+                            "delivered source unreadable; copy freshness cannot be verified: {err}"
+                        )),
+                    ),
+                },
+                None => (
+                    ConditionStatus::False,
+                    Some("receipt has no plugin directory resource".to_string()),
+                ),
+            };
+            conditions.push(AdapterCondition {
+                kind: AdapterConditionKind::TreePresent,
+                status,
+                reason,
+                resource: Some(ClaimResourceRef {
+                    id: RES_PLUGIN.to_string(),
+                }),
+            });
+            status
+        };
 
         // 3. Plugin still registered? Skill-only receipts have no plugin
         //    registry entry by design, so status does not require one.
@@ -355,7 +398,12 @@ impl FrameworkDriver for HermesDriver {
             plugin_registered
         };
 
-        let summary = summarize(claim.status, detect.detected, plugin_registered);
+        let summary = summarize(
+            claim.status,
+            detect.detected,
+            tree_status,
+            plugin_registered,
+        );
         Ok(AdapterStatusReport {
             summary,
             conditions,
@@ -438,32 +486,6 @@ impl FrameworkDriver for HermesDriver {
 }
 
 impl HermesDriver {
-    /// Build the `ResourceBundleMatches` condition by re-digesting the
-    /// resource root and comparing to the enable-time digest.
-    fn bundle_match_condition(&self, claim: &AdapterClaim) -> AdapterCondition {
-        let kind = AdapterConditionKind::ResourceBundleMatches;
-        match (&claim.bundle_digest, digest_tree(&claim.resource_root)) {
-            (Some(recorded), Some(current)) if recorded == &current => AdapterCondition {
-                kind,
-                status: ConditionStatus::True,
-                reason: None,
-                resource: None,
-            },
-            (Some(_), Some(_)) => AdapterCondition {
-                kind,
-                status: ConditionStatus::False,
-                reason: Some("resource bundle changed since enable".to_string()),
-                resource: None,
-            },
-            _ => AdapterCondition {
-                kind,
-                status: ConditionStatus::Unknown,
-                reason: Some("no digest recorded or resource root unavailable".to_string()),
-                resource: None,
-            },
-        }
-    }
-
     /// Run `hermes plugins list` and decide whether `plugin_id` is still
     /// registered. Returns `(plugin_condition, verification_condition,
     /// plugin_registered_status)`.
@@ -723,6 +745,14 @@ fn claim_plugin_id(claim: &AdapterClaim) -> Option<String> {
     claim.plugin_id.clone()
 }
 
+/// The plugin directory the receipt claims — the copy hermes executes.
+fn claim_plugin_dir(claim: &AdapterClaim) -> Option<PathBuf> {
+    claim.resource(RES_PLUGIN).and_then(|res| match &res.kind {
+        ClaimResourceKind::ExternalPath { path } => Some(path.clone()),
+        _ => None,
+    })
+}
+
 /// Plugin id from a bundle, or [`AdapterError::BundleInvalid`] when none
 /// is resolvable.
 fn require_plugin_id(bundle: &AdapterBundle) -> Result<String, AdapterError> {
@@ -776,56 +806,20 @@ fn bool_status(b: bool) -> ConditionStatus {
 fn summarize(
     claim_status: ClaimStatus,
     framework_detected: bool,
+    tree: ConditionStatus,
     plugin_registered: ConditionStatus,
 ) -> AdapterSummary {
     if claim_status == ClaimStatus::CleanupFailed {
         return AdapterSummary::CleanupFailed;
     }
-    if !framework_detected {
+    if !framework_detected || tree == ConditionStatus::False {
         return AdapterSummary::Degraded;
     }
-    match plugin_registered {
-        ConditionStatus::True => AdapterSummary::Healthy,
-        ConditionStatus::False => AdapterSummary::Degraded,
-        ConditionStatus::Unknown => AdapterSummary::Unknown,
+    match (tree, plugin_registered) {
+        (_, ConditionStatus::False) => AdapterSummary::Degraded,
+        (ConditionStatus::Unknown, _) | (_, ConditionStatus::Unknown) => AdapterSummary::Unknown,
+        _ => AdapterSummary::Healthy,
     }
-}
-
-/// SHA-256 digest of a directory tree, stable across runs: files are
-/// hashed in sorted relative-path order as `path\0len\0bytes`. Returns
-/// `None` on any IO error so callers fall back to `Unknown` rather than a
-/// wrong verdict.
-fn digest_tree(root: &Path) -> Option<String> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    collect_files(root, &mut files).ok()?;
-    files.sort();
-    let mut hasher = Sha256::new();
-    for path in &files {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        let bytes = std::fs::read(path).ok()?;
-        hasher.update(rel.to_string_lossy().as_bytes());
-        hasher.update([0u8]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update([0u8]);
-        hasher.update(&bytes);
-    }
-    Some(format!("sha256:{:x}", hasher.finalize()))
-}
-
-/// Recursively collect regular-file paths under `dir`. Symlinks are not
-/// followed into directories (their link path is recorded as a file).
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// ISO 8601 UTC timestamp, second precision.
@@ -965,45 +959,30 @@ mod tests {
     #[test]
     fn summarize_prioritizes_cleanup_failed() {
         assert_eq!(
-            summarize(ClaimStatus::CleanupFailed, true, ConditionStatus::True),
+            summarize(
+                ClaimStatus::CleanupFailed,
+                true,
+                ConditionStatus::True,
+                ConditionStatus::True
+            ),
             AdapterSummary::CleanupFailed
         );
     }
 
     #[test]
-    fn summarize_healthy_only_when_detected_and_registered() {
-        assert_eq!(
-            summarize(ClaimStatus::Enabled, true, ConditionStatus::True),
-            AdapterSummary::Healthy
-        );
-        assert_eq!(
-            summarize(ClaimStatus::Enabled, false, ConditionStatus::True),
-            AdapterSummary::Degraded
-        );
-        assert_eq!(
-            summarize(ClaimStatus::Enabled, true, ConditionStatus::False),
-            AdapterSummary::Degraded
-        );
-        assert_eq!(
-            summarize(ClaimStatus::Enabled, true, ConditionStatus::Unknown),
-            AdapterSummary::Unknown
-        );
-    }
-
-    #[test]
-    fn digest_tree_is_stable_and_detects_change() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("a.txt"), b"hello").expect("write");
-        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
-        std::fs::write(dir.path().join("sub/b.txt"), b"world").expect("write");
-
-        let d1 = digest_tree(dir.path()).expect("digest");
-        let d2 = digest_tree(dir.path()).expect("digest again");
-        assert_eq!(d1, d2, "digest must be stable");
-
-        std::fs::write(dir.path().join("sub/b.txt"), b"WORLD").expect("rewrite");
-        let d3 = digest_tree(dir.path()).expect("digest after change");
-        assert_ne!(d1, d3, "digest must change when a file changes");
+    fn summarize_healthy_only_when_detected_fresh_and_registered() {
+        use ConditionStatus::{False, True, Unknown};
+        let s = |detected, tree, registered| {
+            summarize(ClaimStatus::Enabled, detected, tree, registered)
+        };
+        assert_eq!(s(true, True, True), AdapterSummary::Healthy);
+        assert_eq!(s(false, True, True), AdapterSummary::Degraded);
+        assert_eq!(s(true, True, False), AdapterSummary::Degraded);
+        assert_eq!(s(true, True, Unknown), AdapterSummary::Unknown);
+        // A diverged or unverifiable copy caps the summary even with a
+        // clean registration.
+        assert_eq!(s(true, False, True), AdapterSummary::Degraded);
+        assert_eq!(s(true, Unknown, True), AdapterSummary::Unknown);
     }
 
     // -- review fix coverage: lazy plugin_id, YAML entry, skills allowlist --
@@ -1119,7 +1098,6 @@ mod tests {
 
         let bundle = AdapterBundle {
             resource_root: root.to_path_buf(),
-            digest: None,
             plugin_id: Some("test-plugin".to_string()),
         };
 

@@ -34,8 +34,6 @@ use serde_json::Value;
 use crate::path_safety::{PathBoundaryError, canonicalize_nearest_existing, validate_owned_path};
 use anolisa_platform::fs_layout::FsLayout;
 
-use super::util::digest_tree;
-
 /// Schema version for the generic claim shape and [`ClaimResource`].
 /// Persisted in every receipt so a future on-disk migration can branch.
 pub const CLAIM_SCHEMA_VERSION: u32 = 1;
@@ -82,10 +80,20 @@ pub struct AdapterClaim {
     /// Resource directory read at enable time. Kept for status display and
     /// upgrade detection; `disable` must NOT depend on it still existing.
     pub resource_root: PathBuf,
-    /// Digest of the resource tree at enable time, for drift/upgrade
-    /// detection. Optional: a driver may decline to compute one.
+    /// Legacy: enable-time digest of the resource tree. Written by releases
+    /// that detected staleness by re-hashing the whole resource root — a
+    /// scheme retired because runtime-derived files (e.g. Python's
+    /// `__pycache__`) legitimately appear under an in-place-executed root
+    /// and made healthy adapters report drift (#2252). Kept so old
+    /// receipts still round-trip; never written or compared by new code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_digest: Option<String>,
+    /// Version of the component (from its contract manifest) at enable
+    /// time. Compared against the currently resolved contract version to
+    /// detect "component updated since enable" without inspecting the
+    /// resource tree. `None` on receipts written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_version: Option<String>,
     /// [`DriverPayload`] schema version ([`DRIVER_SCHEMA_VERSION`] at write
     /// time).
     pub driver_schema: u32,
@@ -113,18 +121,22 @@ impl AdapterClaim {
         self.adapter_type.as_deref() == Some("skill_bundle")
     }
 
-    /// Compare the enable-time [`Self::bundle_digest`] against a fresh digest
-    /// of [`Self::resource_root`].
+    /// Compare the enable-time [`Self::component_version`] against the
+    /// version the component's contract currently declares.
     ///
-    /// This is the drift/upgrade detection the `bundle_digest` field exists
-    /// for; the drivers' `ResourceBundleMatches` condition and post-update
-    /// adapter actions branch on the same verdict, so the comparison lives
-    /// with the receipt schema instead of being re-derived per caller.
-    pub fn bundle_match(&self) -> BundleMatch {
-        match (&self.bundle_digest, digest_tree(&self.resource_root)) {
-            (Some(recorded), Some(current)) if recorded == &current => BundleMatch::Matched,
-            (Some(_), Some(_)) => BundleMatch::Changed,
-            _ => BundleMatch::Unknown,
+    /// This is the staleness detection the `component_version` field exists
+    /// for; the Manager's `SourceVersionMatches` status condition and the
+    /// post-update adapter actions branch on the same verdict, so the
+    /// comparison lives with the receipt schema instead of being re-derived
+    /// per caller. The verdict deliberately never inspects the resource
+    /// tree: what invalidates an enable is the *component* changing
+    /// underneath it, which the delivered contract announces — files a
+    /// runtime derives inside the resource root are not a signal.
+    pub fn source_freshness(&self, current_version: Option<&str>) -> SourceFreshness {
+        match (self.component_version.as_deref(), current_version) {
+            (Some(recorded), Some(current)) if recorded == current => SourceFreshness::Current,
+            (Some(_), Some(_)) => SourceFreshness::Stale,
+            _ => SourceFreshness::Unknown,
         }
     }
 
@@ -269,45 +281,47 @@ impl AdapterClaim {
     }
 }
 
-/// Reason text for reports about a receipt whose resource bundle changed
-/// after enable. The drivers' `ResourceBundleMatches` status condition and
-/// the post-update adapter actions share this wording so `adapter status`
-/// and `update` name the same problem identically.
-pub const BUNDLE_CHANGED_REASON: &str = "resource bundle changed since enable";
+/// Reason text for reports about a receipt whose source component was
+/// updated after enable. The Manager's `SourceVersionMatches` status
+/// condition and the post-update adapter actions share this wording so
+/// `adapter status` and `update` name the same problem identically.
+pub const COMPONENT_UPDATED_REASON: &str = "component updated since enable";
 
-/// How a receipt's enable-time bundle digest compares to the resource tree
-/// currently on disk.
+/// How a receipt's enable-time component version compares to the version
+/// the component's contract currently declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BundleMatch {
-    /// The recorded digest matches a fresh digest of the resource root.
-    Matched,
-    /// Both digests exist and differ: the resource bundle changed after
+pub enum SourceFreshness {
+    /// The recorded version equals the currently declared version.
+    Current,
+    /// Both versions are known and differ: the component was updated after
     /// enable, so the framework-side state no longer corresponds to the
-    /// component's current adapter resources.
-    Changed,
-    /// No digest was recorded at enable time or the resource root cannot be
-    /// digested now; drift cannot be decided either way.
+    /// component's current adapter resources until re-enable.
+    Stale,
+    /// No version was recorded at enable time (pre-upgrade receipt) or the
+    /// current version cannot be resolved; staleness cannot be decided
+    /// either way.
     Unknown,
 }
 
-/// Enabled receipts for `component` whose resource bundle changed since
-/// enable — the receipts a component update leaves stale until the adapter
-/// is re-enabled.
+/// Enabled receipts for `component` whose source component was updated
+/// since enable — the receipts a component update leaves stale until the
+/// adapter is re-enabled.
 ///
-/// Receipts without a recorded digest (or with an unreadable resource root)
-/// are excluded: their drift is unknown, not detected. Receipts kept for a
-/// failed disable (`CleanupFailed`) are not enabled adapters and are
-/// excluded too.
+/// Receipts without a recorded version (or when `current_version` is
+/// unknown) are excluded: their staleness is unknown, not detected.
+/// Receipts kept for a failed disable (`CleanupFailed`) are not enabled
+/// adapters and are excluded too.
 pub fn stale_enabled_claims<'a>(
     claims: &'a [AdapterClaim],
     component: &str,
+    current_version: Option<&str>,
 ) -> Vec<&'a AdapterClaim> {
     claims
         .iter()
         .filter(|claim| {
             claim.component == component
                 && claim.status == ClaimStatus::Enabled
-                && claim.bundle_match() == BundleMatch::Changed
+                && claim.source_freshness(current_version) == SourceFreshness::Stale
         })
         .collect()
 }
@@ -1036,6 +1050,7 @@ mod tests {
             enabled_at: "2026-06-12T10:30:45Z".to_string(),
             resource_root: PathBuf::from("/usr/local/share/anolisa/adapters/tokenless/openclaw"),
             bundle_digest: Some("sha256:abc".to_string()),
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -1093,46 +1108,45 @@ mod tests {
         assert_eq!(claim, parsed);
     }
 
-    fn bundle_claim(root: &Path, digest: Option<String>) -> AdapterClaim {
+    fn versioned_claim(version: Option<&str>) -> AdapterClaim {
         let mut claim = sample_claim();
-        claim.resource_root = root.to_path_buf();
-        claim.bundle_digest = digest;
+        claim.component_version = version.map(str::to_string);
         claim
     }
 
     #[test]
-    fn bundle_match_classifies_matched_changed_and_unknown() {
-        let dir = tempfile::tempdir().expect("tmpdir");
-        std::fs::write(dir.path().join("bundle.json"), b"v1").expect("write bundle");
-        let mut claim = bundle_claim(dir.path(), None);
+    fn source_freshness_classifies_current_stale_and_unknown() {
+        let mut claim = versioned_claim(None);
 
-        // No digest recorded at enable time: drift cannot be decided.
-        assert_eq!(claim.bundle_match(), BundleMatch::Unknown);
+        // No version recorded at enable time: staleness cannot be decided.
+        assert_eq!(
+            claim.source_freshness(Some("0.9.0")),
+            SourceFreshness::Unknown
+        );
 
-        claim.bundle_digest = digest_tree(dir.path());
-        assert_eq!(claim.bundle_match(), BundleMatch::Matched);
+        claim.component_version = Some("0.9.0".to_string());
+        assert_eq!(
+            claim.source_freshness(Some("0.9.0")),
+            SourceFreshness::Current
+        );
+        assert_eq!(
+            claim.source_freshness(Some("0.10.0")),
+            SourceFreshness::Stale
+        );
 
-        std::fs::write(dir.path().join("bundle.json"), b"v2").expect("rewrite bundle");
-        assert_eq!(claim.bundle_match(), BundleMatch::Changed);
-
-        // A vanished resource root is Unknown again, not Changed: the
-        // verdict must never rest on a digest that could not be computed.
-        std::fs::remove_dir_all(dir.path()).expect("remove bundle root");
-        assert_eq!(claim.bundle_match(), BundleMatch::Unknown);
+        // An unresolvable current version is Unknown again, not Stale: the
+        // verdict must never rest on a version that could not be read.
+        assert_eq!(claim.source_freshness(None), SourceFreshness::Unknown);
     }
 
     #[test]
-    fn stale_enabled_claims_selects_only_enabled_changed_receipts() {
-        let dir = tempfile::tempdir().expect("tmpdir");
-        std::fs::write(dir.path().join("bundle.json"), b"v1").expect("write bundle");
-        let current = digest_tree(dir.path()).expect("digest");
-
-        let fresh = bundle_claim(dir.path(), Some(current));
-        let mut stale = bundle_claim(dir.path(), Some("sha256:enable-time".to_string()));
+    fn stale_enabled_claims_selects_only_enabled_outdated_receipts() {
+        let fresh = versioned_claim(Some("0.10.0"));
+        let mut stale = versioned_claim(Some("0.9.0"));
         stale.framework = "cosh".to_string();
         let mut retry_cleanup = stale.clone();
         retry_cleanup.status = ClaimStatus::CleanupFailed;
-        let no_digest = bundle_claim(dir.path(), None);
+        let no_version = versioned_claim(None);
         let mut other_component = stale.clone();
         other_component.component = "agent-memory".to_string();
 
@@ -1140,27 +1154,28 @@ mod tests {
             fresh,
             stale.clone(),
             retry_cleanup,
-            no_digest,
+            no_version,
             other_component.clone(),
         ];
         assert_eq!(
-            stale_enabled_claims(&claims, "tokenless"),
+            stale_enabled_claims(&claims, "tokenless", Some("0.10.0")),
             vec![&stale],
-            "only the enabled receipt with a changed bundle qualifies"
+            "only the enabled receipt recorded against an older version qualifies"
         );
         assert_eq!(
-            stale_enabled_claims(&claims, "agent-memory"),
+            stale_enabled_claims(&claims, "agent-memory", Some("0.10.0")),
             vec![&other_component],
             "a receipt is only ever reported under its own component"
+        );
+        assert!(
+            stale_enabled_claims(&claims, "tokenless", None).is_empty(),
+            "an unknown current version detects nothing rather than everything"
         );
     }
 
     #[test]
-    fn bundle_changed_reason_matches_the_status_condition_wording() {
-        assert_eq!(
-            BUNDLE_CHANGED_REASON,
-            "resource bundle changed since enable"
-        );
+    fn component_updated_reason_matches_the_status_condition_wording() {
+        assert_eq!(COMPONENT_UPDATED_REASON, "component updated since enable");
     }
 
     #[test]
@@ -1232,6 +1247,7 @@ mod tests {
             enabled_at: "2026-06-22T10:30:45Z".to_string(),
             resource_root: PathBuf::from("/usr/local/share/anolisa/adapters/agent-sec/hermes"),
             bundle_digest: Some("sha256:def".to_string()),
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -1346,6 +1362,7 @@ mod tests {
             enabled_at: "2026-06-22T12:00:00Z".to_string(),
             resource_root: PathBuf::from("/data/adapters/sec-core/openclaw"),
             bundle_digest: None,
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -1439,6 +1456,7 @@ mod tests {
             enabled_at: "2026-07-04T10:30:45Z".to_string(),
             resource_root: PathBuf::from("/usr/local/share/anolisa/adapters/tokenless/codex"),
             bundle_digest: Some("sha256:c0de".to_string()),
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -1528,6 +1546,7 @@ mod tests {
             enabled_at: "2026-07-04T10:30:45Z".to_string(),
             resource_root: PathBuf::from("/usr/local/share/anolisa/adapters/tokenless/common"),
             bundle_digest: Some("sha256:c05h".to_string()),
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -1564,6 +1583,7 @@ mod tests {
             enabled_at: "2026-07-04T10:30:45Z".to_string(),
             resource_root: PathBuf::from("/usr/local/share/anolisa/adapters/tokenless/claude-code"),
             bundle_digest: None,
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -1605,6 +1625,7 @@ mod tests {
             enabled_at: "2026-07-08T10:30:45Z".to_string(),
             resource_root: PathBuf::from("/usr/local/share/anolisa/adapters/tokenless/qoder"),
             bundle_digest: Some("sha256:90de".to_string()),
+            component_version: None,
             driver_schema: 1,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -1759,6 +1780,7 @@ mod tests {
             enabled_at: "2026-07-16T10:30:45Z".to_string(),
             resource_root: PathBuf::from("/usr/local/share/anolisa/adapters/tokenless/qwencode"),
             bundle_digest: Some("sha256:0wen".to_string()),
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),

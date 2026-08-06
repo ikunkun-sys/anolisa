@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use anolisa_platform::fs_layout::{FsLayout, InstallMode};
 
 use super::AdapterError;
-use super::claim::{AdapterClaim, ClaimStatus};
+use super::claim::{AdapterClaim, COMPONENT_UPDATED_REASON, ClaimStatus, SourceFreshness};
 use super::driver::{
     AdapterCondition, AdapterConditionKind, AdapterOps, AdapterStatusReport, AdapterSummary,
     CliOutput, ConditionStatus, DisableReport, DriverCtx, DriverPlan, EnableProgress,
@@ -176,6 +176,10 @@ struct SourceProbe {
     status: AdapterSourceStatus,
     resource_root: Option<PathBuf>,
     reason: Option<String>,
+    /// Version the component's contract currently declares, when the source
+    /// resolved. Compared against the receipt's enable-time
+    /// `component_version` for the `SourceVersionMatches` condition.
+    version: Option<String>,
 }
 
 /// Full result of [`AdapterManager::scan`].
@@ -981,6 +985,19 @@ impl AdapterManager {
         // disable can show `post_disable` notices from the receipt alone.
         // Inert text — never expanded or executed.
         claim.notices = all_notices;
+        // Record the contract's component version so status/update can
+        // detect "component updated since enable" by comparing versions.
+        // Manager-set (not driver-set): the version is a fact about the
+        // component contract, which drivers never read. The same
+        // delivery-contract preference as the status probe applies, so an
+        // enable after an out-of-band package upgrade records the version
+        // of the files actually on disk, not a stale snapshot's.
+        claim.component_version = Some(current_contract_version(
+            component,
+            &manifest,
+            &scoped_datadir_roots,
+            contract_datadir_root.as_deref(),
+        ));
         let claim_allowed_roots = driver.allowed_external_roots(&ctx);
         if let Some(prior) = state.find_adapter_claim(component, &framework).cloned() {
             // A forged prior receipt must not gain authority merely because a
@@ -1293,9 +1310,10 @@ impl AdapterManager {
                     entries.push(StatusEntry {
                         component: claim.component.clone(),
                         framework,
-                        report: with_source_condition(
+                        report: with_manager_conditions(
                             unverified_report("no built-in driver for framework"),
                             &source,
+                            claim,
                         ),
                     });
                     continue;
@@ -1377,7 +1395,7 @@ impl AdapterManager {
                 &trust.target_roots,
                 trust.exact_targets(),
             )?;
-            let report = with_source_condition(driver.status(claim, &ctx)?, &source);
+            let report = with_manager_conditions(driver.status(claim, &ctx)?, &source, claim);
             entries.push(StatusEntry {
                 component: claim.component.clone(),
                 framework,
@@ -1489,6 +1507,12 @@ impl AdapterManager {
                     status: AdapterSourceStatus::Available,
                     resource_root: Some(resource_root),
                     reason: None,
+                    version: Some(current_contract_version(
+                        component,
+                        &manifest,
+                        &vr.contract_datadir_roots,
+                        contract_datadir_root.as_deref(),
+                    )),
                 }
             }
             Ok((resource_root, _)) => source_missing(format!(
@@ -3514,7 +3538,38 @@ fn source_missing(reason: String) -> SourceProbe {
         status: AdapterSourceStatus::Missing,
         resource_root: None,
         reason: Some(reason),
+        version: None,
     }
+}
+
+/// Version the component's delivery contract currently declares.
+///
+/// Contract resolution prefers the state snapshot for layout and resource
+/// decisions (a stable view of what the last ANOLISA operation used), but
+/// the snapshot is a cache: an out-of-band package upgrade (e.g. `dnf
+/// update`) rewrites the datadir contract without refreshing it. For
+/// version staleness the delivery contract is the authority, so this
+/// consults the datadir contracts directly and falls back to the
+/// already-resolved (possibly snapshot-sourced) manifest only when no
+/// datadir contract names this component.
+///
+/// `provenance_root` is the datadir root the snapshot's provenance names
+/// (see [`contract_datadir_root_from_source`]); it is searched first so a
+/// stale leftover contract in an earlier-ordered datadir root (e.g. the
+/// local datadir shadowing the packaged one the component actually
+/// installs from) cannot mask the updated delivery contract.
+fn current_contract_version(
+    component: &str,
+    resolved_manifest: &ComponentManifest,
+    datadir_roots: &[PathBuf],
+    provenance_root: Option<&Path>,
+) -> String {
+    let ordered = prioritize_datadir_root(datadir_roots, provenance_root);
+    super::contract::resolve_component_contract(component, &[], &ordered)
+        .ok()
+        .filter(|manifest| manifest.component.name == component)
+        .map(|manifest| manifest.component.version)
+        .unwrap_or_else(|| resolved_manifest.component.version.clone())
 }
 
 fn source_condition(source: &SourceProbe) -> AdapterCondition {
@@ -3529,16 +3584,82 @@ fn source_condition(source: &SourceProbe) -> AdapterCondition {
     }
 }
 
-fn with_source_condition(
+/// Build the `SourceVersionMatches` condition from the receipt's
+/// enable-time component version and the version the component's contract
+/// currently declares (carried by the source probe).
+///
+/// Manager-level on purpose: staleness is a fact about the receipt versus
+/// the installed component, not about any framework, so no driver computes
+/// it — and it never inspects the resource tree, so files a runtime derives
+/// inside the resource root (e.g. Python's `__pycache__`, #2252) can never
+/// register as drift.
+fn source_version_condition(claim: &AdapterClaim, source: &SourceProbe) -> AdapterCondition {
+    let kind = AdapterConditionKind::SourceVersionMatches;
+    match (
+        claim.source_freshness(source.version.as_deref()),
+        claim.component_version.as_deref(),
+        source.version.as_deref(),
+    ) {
+        (SourceFreshness::Current, ..) => AdapterCondition {
+            kind,
+            status: ConditionStatus::True,
+            reason: None,
+            resource: None,
+        },
+        (SourceFreshness::Stale, Some(recorded), Some(current)) => AdapterCondition {
+            kind,
+            status: ConditionStatus::False,
+            reason: Some(format!(
+                "{COMPONENT_UPDATED_REASON} ({recorded} -> {current}); re-enable to refresh"
+            )),
+            resource: None,
+        },
+        (_, recorded, current) => AdapterCondition {
+            kind,
+            status: ConditionStatus::Unknown,
+            reason: Some(match (recorded, current) {
+                (None, Some(_)) => {
+                    "receipt predates version tracking; re-enable to record the component version"
+                        .to_string()
+                }
+                (Some(_), None) => "current component version unavailable".to_string(),
+                _ => "no component version recorded at enable and current version unavailable"
+                    .to_string(),
+            }),
+            resource: None,
+        },
+    }
+}
+
+/// Prepend the Manager-level conditions (`SourceAvailable`,
+/// `SourceVersionMatches`) to a driver report and fold them into the
+/// summary: a missing source or a stale version degrades. An undecidable
+/// version downgrades Healthy to Unknown only when a recorded version
+/// exists but the current one could not be read — a genuine verification
+/// failure. A legacy receipt with no recorded version keeps the driver's
+/// summary: its staleness was never checkable, so blanking Healthy would
+/// punish every pre-upgrade receipt until re-enable while the condition
+/// row already names the migration path. `CleanupFailed` always wins.
+fn with_manager_conditions(
     mut report: AdapterStatusReport,
     source: &SourceProbe,
+    claim: &AdapterClaim,
 ) -> AdapterStatusReport {
-    if source.status == AdapterSourceStatus::Missing
-        && report.summary != AdapterSummary::CleanupFailed
-    {
-        report.summary = AdapterSummary::Degraded;
+    let version_condition = source_version_condition(claim, source);
+    if report.summary != AdapterSummary::CleanupFailed {
+        if source.status == AdapterSourceStatus::Missing
+            || version_condition.status == ConditionStatus::False
+        {
+            report.summary = AdapterSummary::Degraded;
+        } else if version_condition.status == ConditionStatus::Unknown
+            && claim.component_version.is_some()
+            && report.summary == AdapterSummary::Healthy
+        {
+            report.summary = AdapterSummary::Unknown;
+        }
     }
     report.conditions.insert(0, source_condition(source));
+    report.conditions.insert(1, version_condition);
     report
 }
 
@@ -4301,6 +4422,7 @@ source = "adapters/openclaw"
             enabled_at: "2026-07-09T00:00:00Z".to_string(),
             resource_root,
             bundle_digest: None,
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -4330,6 +4452,70 @@ source = "adapters/openclaw"
         state
             .save(&state_dir.join("installed.toml"))
             .expect("save state");
+    }
+
+    #[test]
+    fn manager_conditions_fold_version_freshness_into_summary() {
+        fn healthy_report() -> AdapterStatusReport {
+            AdapterStatusReport {
+                summary: AdapterSummary::Healthy,
+                conditions: Vec::new(),
+            }
+        }
+        fn probe(version: Option<&str>) -> SourceProbe {
+            SourceProbe {
+                status: AdapterSourceStatus::Available,
+                resource_root: None,
+                reason: None,
+                version: version.map(str::to_string),
+            }
+        }
+        let mut claim = openclaw_claim(
+            "tokenless",
+            std::path::PathBuf::from("/data/adapters/tokenless/openclaw"),
+        );
+
+        // Same version: condition True, driver summary untouched.
+        claim.component_version = Some("0.9.0".to_string());
+        let report = with_manager_conditions(healthy_report(), &probe(Some("0.9.0")), &claim);
+        assert_eq!(report.summary, AdapterSummary::Healthy);
+        assert_eq!(
+            report.conditions[1].kind,
+            AdapterConditionKind::SourceVersionMatches
+        );
+        assert_eq!(report.conditions[1].status, ConditionStatus::True);
+
+        // Component updated: False, both versions named, degraded.
+        let report = with_manager_conditions(healthy_report(), &probe(Some("0.10.0")), &claim);
+        assert_eq!(report.summary, AdapterSummary::Degraded);
+        assert_eq!(report.conditions[1].status, ConditionStatus::False);
+        let reason = report.conditions[1].reason.as_deref().expect("reason");
+        assert!(reason.contains("0.9.0 -> 0.10.0"), "{reason}");
+
+        // Recorded version but current unreadable: a genuine verification
+        // failure downgrades Healthy to Unknown.
+        let report = with_manager_conditions(healthy_report(), &probe(None), &claim);
+        assert_eq!(report.summary, AdapterSummary::Unknown);
+        assert_eq!(report.conditions[1].status, ConditionStatus::Unknown);
+
+        // Legacy receipt (no recorded version): the condition stays Unknown
+        // and names the migration path, but the driver's Healthy verdict
+        // stands — staleness was never checkable for such receipts.
+        claim.component_version = None;
+        let report = with_manager_conditions(healthy_report(), &probe(Some("0.10.0")), &claim);
+        assert_eq!(report.summary, AdapterSummary::Healthy);
+        assert_eq!(report.conditions[1].status, ConditionStatus::Unknown);
+        let reason = report.conditions[1].reason.as_deref().expect("reason");
+        assert!(reason.contains("re-enable"), "{reason}");
+
+        // Staleness never overrides CleanupFailed.
+        claim.component_version = Some("0.9.0".to_string());
+        let cleanup = AdapterStatusReport {
+            summary: AdapterSummary::CleanupFailed,
+            conditions: Vec::new(),
+        };
+        let report = with_manager_conditions(cleanup, &probe(Some("0.10.0")), &claim);
+        assert_eq!(report.summary, AdapterSummary::CleanupFailed);
     }
 
     #[test]
@@ -4498,6 +4684,7 @@ entry = "cosh-extension.json"
             enabled_at: "2026-07-09T00:00:00Z".to_string(),
             resource_root,
             bundle_digest: None,
+            component_version: None,
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -7385,6 +7572,7 @@ dest = "{datadir}/skills"
             enabled_at: "2026-06-30T00:00:00Z".to_string(),
             resource_root: PathBuf::from("/fake/adapters/test-comp/openclaw"),
             bundle_digest: None,
+            component_version: None,
             driver_schema: 1,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -7570,6 +7758,7 @@ dest = "{datadir}/skills"
             enabled_at: "2026-06-30T00:00:00Z".to_string(),
             resource_root: PathBuf::from("/fake/adapters/test-comp/hermes"),
             bundle_digest: None,
+            component_version: None,
             driver_schema: 1,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -7642,6 +7831,7 @@ dest = "{datadir}/skills"
             enabled_at: "2026-06-30T00:00:00Z".to_string(),
             resource_root: PathBuf::from("/fake/adapters/test-comp/hermes"),
             bundle_digest: None,
+            component_version: None,
             driver_schema: 1,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),

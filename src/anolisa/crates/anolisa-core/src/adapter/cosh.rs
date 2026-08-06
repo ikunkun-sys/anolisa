@@ -30,7 +30,7 @@ use super::driver::{
     ClaimResourceRef, ConditionStatus, DetectResult, DisableReport, DriverCtx, DriverPlan,
     FrameworkDriver, HostEnv, PreparedEnable, find_binary_in_path,
 };
-use super::util::{bool_status, digest_tree, now_iso8601};
+use super::util::{bool_status, copy_divergence, display_paths, now_iso8601};
 
 /// Candidate binary names that indicate cosh is installed. `co` and
 /// `copilot` are the short/legacy aliases of the `cosh` CLI.
@@ -140,7 +140,6 @@ impl FrameworkDriver for CoshDriver {
         );
         Ok(AdapterBundle {
             resource_root: root.clone(),
-            digest: digest_tree(root),
             plugin_id,
         })
     }
@@ -184,7 +183,8 @@ impl FrameworkDriver for CoshDriver {
                 adapter_type: ctx.adapter_type.clone(),
                 enabled_at: now_iso8601(),
                 resource_root: bundle.resource_root.clone(),
-                bundle_digest: bundle.digest.clone(),
+                bundle_digest: None,
+                component_version: None,
                 driver_schema: DRIVER_SCHEMA_VERSION,
                 status: ClaimStatus::Enabled,
                 notices: Vec::new(),
@@ -258,35 +258,50 @@ impl FrameworkDriver for CoshDriver {
             resource: None,
         });
 
-        // 2. Resource bundle still matches the enable-time digest?
-        conditions.push(bundle_match_condition(claim));
-
-        // 3. Extension tree still present, carrying its manifest AND our
-        //    ownership marker? A dir/manifest without the marker is not
-        //    ANOLISA-managed (user replaced it, or a marker write failed),
-        //    which is a degraded state — not a healthy one. This is a
-        //    reliable, read-only filesystem check, so verification is always
-        //    supported for cosh.
-        let (tree_present, tree_reason) = match claim_extension_dir(claim) {
+        // 2. Extension tree still present, carrying its manifest AND our
+        //    ownership marker, AND still matching the delivered source?
+        //    cosh executes the copy, not the resource root, so a copy that
+        //    lags a same-version source update (or was edited in place) is
+        //    a degraded state even though every file "exists". Extra files
+        //    in the copy are ignored: runtime-derived state (`__pycache__`)
+        //    legitimately accretes there and is not divergence. This is a
+        //    reliable, read-only filesystem check, so verification is
+        //    always supported for cosh.
+        let (tree_status, tree_reason) = match claim_extension_dir(claim) {
             Some(dir) if !dir.is_dir() || !dir.join(COSH_MANIFEST).is_file() => (
-                false,
+                ConditionStatus::False,
                 Some("cosh extension directory or manifest missing".to_string()),
             ),
             Some(dir) if !is_anolisa_owned(&dir) => (
-                false,
+                ConditionStatus::False,
                 Some(format!(
                     "cosh extension directory is not ANOLISA-managed ({COSH_OWNERSHIP_MARKER} marker missing)"
                 )),
             ),
-            Some(_) => (true, None),
+            Some(dir) => match copy_divergence(&ctx.resource_root, &dir) {
+                Ok(diverged) if diverged.is_empty() => (ConditionStatus::True, None),
+                Ok(diverged) => (
+                    ConditionStatus::False,
+                    Some(format!(
+                        "copied extension differs from the delivered source ({}); re-enable to refresh",
+                        display_paths(&diverged),
+                    )),
+                ),
+                Err(err) => (
+                    ConditionStatus::Unknown,
+                    Some(format!(
+                        "delivered source unreadable; copy freshness cannot be verified: {err}"
+                    )),
+                ),
+            },
             None => (
-                false,
+                ConditionStatus::False,
                 Some("receipt has no extension directory".to_string()),
             ),
         };
         conditions.push(AdapterCondition {
             kind: AdapterConditionKind::TreePresent,
-            status: bool_status(tree_present),
+            status: tree_status,
             reason: tree_reason,
             resource: Some(ClaimResourceRef {
                 id: RES_EXTENSION_DIR.to_string(),
@@ -299,7 +314,7 @@ impl FrameworkDriver for CoshDriver {
             resource: None,
         });
 
-        let summary = summarize(claim.status, detect.detected, tree_present);
+        let summary = summarize(claim.status, detect.detected, tree_status);
         Ok(AdapterStatusReport {
             summary,
             conditions,
@@ -428,49 +443,24 @@ fn claim_extension_dir(claim: &AdapterClaim) -> Option<PathBuf> {
     })
 }
 
-/// Build the `ResourceBundleMatches` condition by re-digesting the resource
-/// root and comparing to the enable-time digest.
-fn bundle_match_condition(claim: &AdapterClaim) -> AdapterCondition {
-    let kind = AdapterConditionKind::ResourceBundleMatches;
-    match (&claim.bundle_digest, digest_tree(&claim.resource_root)) {
-        (Some(recorded), Some(current)) if recorded == &current => AdapterCondition {
-            kind,
-            status: ConditionStatus::True,
-            reason: None,
-            resource: None,
-        },
-        (Some(_), Some(_)) => AdapterCondition {
-            kind,
-            status: ConditionStatus::False,
-            reason: Some("resource bundle changed since enable".to_string()),
-            resource: None,
-        },
-        _ => AdapterCondition {
-            kind,
-            status: ConditionStatus::Unknown,
-            reason: Some("no digest recorded or resource root unavailable".to_string()),
-            resource: None,
-        },
-    }
-}
-
-/// Roll the detect and tree-present signals into a summary, honoring a
-/// `cleanup_failed` receipt.
+/// Roll the detect and tree signals into a summary, honoring a
+/// `cleanup_failed` receipt. An unverifiable tree (source unreadable) is
+/// Unknown, never Healthy and never Degraded.
 fn summarize(
     claim_status: ClaimStatus,
     framework_detected: bool,
-    tree_present: bool,
+    tree: ConditionStatus,
 ) -> AdapterSummary {
     if claim_status == ClaimStatus::CleanupFailed {
         return AdapterSummary::CleanupFailed;
     }
-    if !tree_present {
+    if tree == ConditionStatus::False || !framework_detected {
         return AdapterSummary::Degraded;
     }
-    if !framework_detected {
-        return AdapterSummary::Degraded;
+    match tree {
+        ConditionStatus::True => AdapterSummary::Healthy,
+        _ => AdapterSummary::Unknown,
     }
-    AdapterSummary::Healthy
 }
 
 #[cfg(test)]
