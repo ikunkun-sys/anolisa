@@ -607,6 +607,16 @@ pub struct HermesClaim {
     /// Resource ids of delivered skill directories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skill_resources: Vec<String>,
+    /// Sorted relative paths of the files copied into the plugin directory
+    /// at enable time (the bundle minus the `skills/` projection). Status
+    /// uses this to detect the removal direction of copy staleness: a file
+    /// the delivery no longer ships but the copy still carries. Empty on
+    /// receipts written before recording existed — removal detection is
+    /// then skipped, never guessed. Additive field, no
+    /// [`DRIVER_SCHEMA_VERSION`] bump: consumers gate on `>=` and an empty
+    /// default degrades gracefully.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_paths: Vec<String>,
 }
 
 /// Cosh (copilot-shell) driver payload. Holds only [`ClaimResource::id`]
@@ -618,6 +628,15 @@ pub struct CoshClaim {
     /// Resource id of the delivered extension directory
     /// ([`ClaimResourceKind::ExternalPath`]).
     pub extension_dir_resource: String,
+    /// Sorted relative paths of the files copied into the extension
+    /// directory at enable time. Status uses this to detect the removal
+    /// direction of copy staleness: a file the delivery no longer ships
+    /// but the copy still carries. Empty on receipts written before
+    /// recording existed — removal detection is then skipped, never
+    /// guessed. Additive field, no [`DRIVER_SCHEMA_VERSION`] bump:
+    /// consumers gate on `>=` and an empty default degrades gracefully.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_paths: Vec<String>,
 }
 
 /// Codex driver payload. Holds only [`ClaimResource::id`] references. Codex
@@ -1271,6 +1290,7 @@ mod tests {
                 home_resource: "hermes_home".to_string(),
                 plugin_resource: "hermes_plugin".to_string(),
                 skill_resources: Vec::new(),
+                delivered_paths: Vec::new(),
             }),
         }
     }
@@ -1559,6 +1579,7 @@ mod tests {
             }],
             driver_payload: DriverPayload::Cosh(CoshClaim {
                 extension_dir_resource: "cosh_extension_dir".to_string(),
+                delivered_paths: Vec::new(),
             }),
         };
         let json = serde_json::to_string(&claim).expect("serialize Cosh JSON");

@@ -1189,6 +1189,7 @@ mod tests {
                 resources: Vec::new(),
                 driver_payload: DriverPayload::Cosh(CoshClaim {
                     extension_dir_resource: "ext".to_string(),
+                    delivered_paths: Vec::new(),
                 }),
             }
         }

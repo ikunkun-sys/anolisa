@@ -988,16 +988,12 @@ impl AdapterManager {
         // Record the contract's component version so status/update can
         // detect "component updated since enable" by comparing versions.
         // Manager-set (not driver-set): the version is a fact about the
-        // component contract, which drivers never read. The same
-        // delivery-contract preference as the status probe applies, so an
-        // enable after an out-of-band package upgrade records the version
-        // of the files actually on disk, not a stale snapshot's.
-        claim.component_version = Some(current_contract_version(
-            component,
-            &manifest,
-            &scoped_datadir_roots,
-            contract_datadir_root.as_deref(),
-        ));
+        // component contract, which drivers never read. Sourced from the
+        // same probe status consults, so enable records exactly what a
+        // later status will compare against — delivery-contract preferred,
+        // recorded-authority arbitration, `None` when undecidable (broken
+        // live contract, ambiguous multi-root without provenance).
+        claim.component_version = self.source_probe(component, &framework, &state).version;
         let claim_allowed_roots = driver.allowed_external_roots(&ctx);
         if let Some(prior) = state.find_adapter_claim(component, &framework).cloned() {
             // A forged prior receipt must not gain authority merely because a
@@ -1483,6 +1479,16 @@ impl AdapterManager {
             &resolved.path,
             &vr.contract_datadir_roots,
         );
+        // Version authority is stricter than resource-resolution provenance:
+        // only a direct datadir hit or a provenance sidecar counts. The
+        // content-match fallback inside `contract_datadir_root_from_source`
+        // is fine for locating files but proves nothing about which root
+        // receives future package updates.
+        let version_authority = super::contract::recorded_contract_authority(
+            component,
+            &resolved.path,
+            &vr.contract_datadir_roots,
+        );
         match self.resolve_resource_root(
             component,
             framework,
@@ -1507,12 +1513,12 @@ impl AdapterManager {
                     status: AdapterSourceStatus::Available,
                     resource_root: Some(resource_root),
                     reason: None,
-                    version: Some(current_contract_version(
+                    version: current_contract_version(
                         component,
                         &manifest,
                         &vr.contract_datadir_roots,
-                        contract_datadir_root.as_deref(),
-                    )),
+                        version_authority.as_deref(),
+                    ),
                 }
             }
             Ok((resource_root, _)) => source_missing(format!(
@@ -3542,34 +3548,64 @@ fn source_missing(reason: String) -> SourceProbe {
     }
 }
 
-/// Version the component's delivery contract currently declares.
+/// Version the component's delivery contracts currently declare, or
+/// `None` when it cannot be decided honestly.
 ///
 /// Contract resolution prefers the state snapshot for layout and resource
 /// decisions (a stable view of what the last ANOLISA operation used), but
 /// the snapshot is a cache: an out-of-band package upgrade (e.g. `dnf
 /// update`) rewrites the datadir contract without refreshing it. For
-/// version staleness the delivery contract is the authority, so this
-/// consults the datadir contracts directly and falls back to the
-/// already-resolved (possibly snapshot-sourced) manifest only when no
-/// datadir contract names this component.
+/// version staleness the delivery contracts are the authority, so this
+/// reads every datadir root's contract directly:
 ///
-/// `provenance_root` is the datadir root the snapshot's provenance names
-/// (see [`contract_datadir_root_from_source`]); it is searched first so a
-/// stale leftover contract in an earlier-ordered datadir root (e.g. the
-/// local datadir shadowing the packaged one the component actually
-/// installs from) cannot mask the updated delivery contract.
+/// - no datadir contract names the component → the resolved (possibly
+///   snapshot-sourced) manifest is the only signal; use its version;
+/// - exactly one distinct version across the roots → that version;
+/// - roots disagree → only *recorded* authority (`authority_root`, from a
+///   direct datadir hit or a snapshot provenance sidecar — never content
+///   matching) may arbitrate; without it the version is `None`, so status
+///   reports Unknown instead of trusting whichever stale leftover
+///   happened to be ordered first;
+/// - a malformed or unreadable live contract → `None`: a broken delivery
+///   must never be collapsed into "absent" and silently confirm the
+///   recorded version as current.
 fn current_contract_version(
     component: &str,
     resolved_manifest: &ComponentManifest,
     datadir_roots: &[PathBuf],
-    provenance_root: Option<&Path>,
-) -> String {
-    let ordered = prioritize_datadir_root(datadir_roots, provenance_root);
-    super::contract::resolve_component_contract(component, &[], &ordered)
-        .ok()
-        .filter(|manifest| manifest.component.name == component)
-        .map(|manifest| manifest.component.version)
-        .unwrap_or_else(|| resolved_manifest.component.version.clone())
+    authority_root: Option<&Path>,
+) -> Option<String> {
+    use super::contract::ContractError;
+
+    let mut found: Vec<(&PathBuf, String)> = Vec::new();
+    for root in datadir_roots {
+        match super::contract::resolve_component_contract(
+            component,
+            &[],
+            std::slice::from_ref(root),
+        ) {
+            Ok(manifest) if manifest.component.name == component => {
+                found.push((root, manifest.component.version));
+            }
+            // A contract naming another component is not ours to read.
+            Ok(_) => {}
+            Err(ContractError::Unavailable { .. }) => {}
+            Err(_) => return None,
+        }
+    }
+    if found.is_empty() {
+        return Some(resolved_manifest.component.version.clone());
+    }
+    let distinct: BTreeSet<&str> = found.iter().map(|(_, version)| version.as_str()).collect();
+    if distinct.len() == 1 {
+        return Some(found[0].1.clone());
+    }
+    authority_root.and_then(|authority| {
+        found
+            .iter()
+            .find(|(root, _)| root.as_path() == authority)
+            .map(|(_, version)| version.clone())
+    })
 }
 
 fn source_condition(source: &SourceProbe) -> AdapterCondition {
@@ -4691,6 +4727,7 @@ entry = "cosh-extension.json"
             resources: Vec::new(),
             driver_payload: DriverPayload::Cosh(CoshClaim {
                 extension_dir_resource: "cosh_extension_dir".to_string(),
+                delivered_paths: Vec::new(),
             }),
         }
     }
@@ -7782,6 +7819,7 @@ dest = "{datadir}/skills"
                 home_resource: "hermes_home".to_string(),
                 plugin_resource: "hermes_plugin".to_string(),
                 skill_resources: Vec::new(),
+                delivered_paths: Vec::new(),
             }),
         };
 
@@ -7855,6 +7893,7 @@ dest = "{datadir}/skills"
                 home_resource: "hermes_home".to_string(),
                 plugin_resource: String::new(),
                 skill_resources: vec!["hermes_skill_audit".to_string()],
+                delivered_paths: Vec::new(),
             }),
         };
 

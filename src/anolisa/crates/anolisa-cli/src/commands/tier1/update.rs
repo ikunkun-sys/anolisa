@@ -4680,6 +4680,7 @@ packages = { rpm = "absent-tool", deb = "absent-tool" }
             resources: Vec::new(),
             driver_payload: DriverPayload::Cosh(CoshClaim {
                 extension_dir_resource: "cosh_extension_dir".to_string(),
+                delivered_paths: Vec::new(),
             }),
         }
     }

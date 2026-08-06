@@ -68,6 +68,36 @@ pub fn write_snapshot_provenance(
     std::fs::write(provenance_path, content)
 }
 
+/// The datadir root that *recorded* provenance names for a resolved
+/// contract: a direct datadir hit, or a snapshot's provenance sidecar.
+///
+/// Unlike [`infer_contract_datadir_root`], this never falls back to
+/// content matching — byte equality between a snapshot and some datadir
+/// contract proves nothing about which root will receive future package
+/// updates, so it must not arbitrate version-staleness authority between
+/// disagreeing roots. Returns `None` when no recorded authority exists.
+pub fn recorded_contract_authority(
+    component: &str,
+    contract_path: &Path,
+    scoped_datadir_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(root) = scoped_datadir_roots
+        .iter()
+        .find(|root| FsLayout::component_contract_path(root, component) == contract_path)
+        .cloned()
+    {
+        return Some(root);
+    }
+    if let Some(prov) = read_snapshot_provenance(contract_path)
+        && prov.source_kind == ContractSourceKind::Datadir
+        && scoped_datadir_roots.contains(&prov.datadir_root)
+        && FsLayout::component_contract_path(&prov.datadir_root, component) == prov.source_path
+    {
+        return Some(prov.datadir_root);
+    }
+    None
+}
+
 /// Determine the effective datadir root for a resolved contract.
 ///
 /// - If `contract_path` is a direct datadir hit (lives under one of

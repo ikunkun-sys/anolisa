@@ -30,7 +30,10 @@ use super::driver::{
     ClaimResourceRef, ConditionStatus, DetectResult, DisableReport, DriverCtx, DriverPlan,
     FrameworkDriver, HostEnv, PreparedEnable, find_binary_in_path,
 };
-use super::util::{bool_status, copy_divergence, display_paths, now_iso8601};
+use super::util::{
+    bool_status, copy_divergence, delivered_files, display_paths, lingering_removed_files,
+    now_iso8601,
+};
 
 /// Candidate binary names that indicate cosh is installed. `co` and
 /// `copilot` are the short/legacy aliases of the `cosh` CLI.
@@ -174,6 +177,14 @@ impl FrameworkDriver for CoshDriver {
             purpose: "cosh_extension_dir".to_string(),
             kind: ClaimResourceKind::ExternalPath { path: dst },
         }];
+        let delivered_paths = delivered_files(&bundle.resource_root, &[])
+            .map_err(|source| AdapterError::Io {
+                path: bundle.resource_root.clone(),
+                source,
+            })?
+            .iter()
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .collect();
         Ok((
             AdapterClaim {
                 claim_schema: CLAIM_SCHEMA_VERSION,
@@ -191,6 +202,7 @@ impl FrameworkDriver for CoshDriver {
                 resources,
                 driver_payload: DriverPayload::Cosh(CoshClaim {
                     extension_dir_resource: RES_EXTENSION_DIR.to_string(),
+                    delivered_paths,
                 }),
             },
             PreparedEnable::None,
@@ -278,15 +290,29 @@ impl FrameworkDriver for CoshDriver {
                     "cosh extension directory is not ANOLISA-managed ({COSH_OWNERSHIP_MARKER} marker missing)"
                 )),
             ),
-            Some(dir) => match copy_divergence(&ctx.resource_root, &dir) {
-                Ok(diverged) if diverged.is_empty() => (ConditionStatus::True, None),
-                Ok(diverged) => (
-                    ConditionStatus::False,
-                    Some(format!(
-                        "copied extension differs from the delivered source ({}); re-enable to refresh",
-                        display_paths(&diverged),
-                    )),
-                ),
+            Some(dir) => match copy_divergence(&ctx.resource_root, &dir, &[]) {
+                Ok(mut diverged) => {
+                    // The removal direction: enable-time files the delivery
+                    // no longer ships but the copy still executes.
+                    diverged.extend(lingering_removed_files(
+                        claim_delivered_paths(claim),
+                        &ctx.resource_root,
+                        &dir,
+                    ));
+                    diverged.sort();
+                    diverged.dedup();
+                    if diverged.is_empty() {
+                        (ConditionStatus::True, None)
+                    } else {
+                        (
+                            ConditionStatus::False,
+                            Some(format!(
+                                "copied extension differs from the delivered source ({}); re-enable to refresh",
+                                display_paths(&diverged),
+                            )),
+                        )
+                    }
+                }
                 Err(err) => (
                     ConditionStatus::Unknown,
                     Some(format!(
@@ -428,6 +454,15 @@ fn extension_dir(bundle: &AdapterBundle, ctx: &DriverCtx) -> Result<PathBuf, Ada
         .clone()
         .unwrap_or_else(|| ctx.component.clone());
     Ok(home.join("extensions").join(id))
+}
+
+/// Enable-time delivered file list from the receipt payload. Empty for
+/// receipts written before recording existed (or non-cosh payloads).
+fn claim_delivered_paths(claim: &AdapterClaim) -> &[String] {
+    match &claim.driver_payload {
+        DriverPayload::Cosh(payload) => &payload.delivered_paths,
+        _ => &[],
+    }
 }
 
 /// Extract the extension directory path from a receipt's external-path

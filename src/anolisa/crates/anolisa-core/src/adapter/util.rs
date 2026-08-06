@@ -10,19 +10,15 @@ use std::path::{Path, PathBuf};
 
 use super::driver::{CliOutput, ConditionStatus, FrameworkCommand};
 
-/// Compare a delivered source tree against an installed copy with subset
-/// semantics: every regular file under `source` must have a byte-identical
-/// counterpart at the same relative path under `copy`. Extra files in the
-/// copy are ignored — the copy is the executed artifact and legitimately
-/// accretes state the delivery never shipped (runtime-derived files such
-/// as Python's `__pycache__`, ownership markers).
-///
-/// Returns the sorted relative paths that are missing from or differ in
-/// the copy (empty means the copy matches the delivery). Returns `Err`
-/// when `source` cannot be walked or read, so callers report `Unknown`
-/// rather than a wrong verdict. Symlinked entries compare their referent
-/// bytes (reads follow links); directories contribute only their files.
-pub(crate) fn copy_divergence(source: &Path, copy: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// Relative paths of every regular file under `root`, sorted, skipping
+/// top-level entries named in `exclude_top`. The exclusion models delivery
+/// projections: a driver that deliberately copies only part of the bundle
+/// (hermes leaves `skills/` to separate skill delivery) records and
+/// compares exactly the projection it copies.
+pub(crate) fn delivered_files(
+    root: &Path,
+    exclude_top: &[&str],
+) -> std::io::Result<Vec<PathBuf>> {
     fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -37,12 +33,53 @@ pub(crate) fn copy_divergence(source: &Path, copy: &Path) -> std::io::Result<Vec
     }
 
     let mut files = Vec::new();
-    collect_files(source, &mut files)?;
-    files.sort();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if exclude_top
+            .iter()
+            .any(|skip| entry.file_name() == std::ffi::OsStr::new(skip))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_files(&path, &mut files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    let mut rels: Vec<PathBuf> = files
+        .into_iter()
+        .map(|path| path.strip_prefix(root).unwrap_or(&path).to_path_buf())
+        .collect();
+    rels.sort();
+    Ok(rels)
+}
+
+/// Compare a delivered source tree against an installed copy with subset
+/// semantics: every regular file under `source` (minus `exclude_top`
+/// projections) must have a byte-identical counterpart at the same
+/// relative path under `copy`. Extra files in the copy are ignored — the
+/// copy is the executed artifact and legitimately accretes state the
+/// delivery never shipped (runtime-derived files such as Python's
+/// `__pycache__`, ownership markers). The removal direction — a file the
+/// delivery no longer ships but the copy still carries — cannot be decided
+/// from these two trees alone and is covered by
+/// [`lingering_removed_files`] against the enable-time record.
+///
+/// Returns the sorted relative paths that are missing from or differ in
+/// the copy (empty means the copy matches the delivery). Returns `Err`
+/// when `source` cannot be walked or read, so callers report `Unknown`
+/// rather than a wrong verdict. Symlinked entries compare their referent
+/// bytes (reads follow links); directories contribute only their files.
+pub(crate) fn copy_divergence(
+    source: &Path,
+    copy: &Path,
+    exclude_top: &[&str],
+) -> std::io::Result<Vec<PathBuf>> {
     let mut diverged = Vec::new();
-    for path in files {
-        let rel = path.strip_prefix(source).unwrap_or(&path).to_path_buf();
-        let delivered = std::fs::read(&path)?;
+    for rel in delivered_files(source, exclude_top)? {
+        let delivered = std::fs::read(source.join(&rel))?;
         // A missing or unreadable counterpart is divergence, not Unknown:
         // the delivery side read fine, so the verdict "the copy does not
         // carry this delivered file" is decidable.
@@ -52,6 +89,26 @@ pub(crate) fn copy_divergence(source: &Path, copy: &Path) -> std::io::Result<Vec
         }
     }
     Ok(diverged)
+}
+
+/// Enable-time delivered paths that the current delivery no longer ships
+/// but the executed copy still carries — the removal direction of copy
+/// staleness (a same-version release dropping a file leaves the copy
+/// executing it until re-enable replaces the tree). `recorded` is the
+/// receipt's enable-time file list; an empty list (receipt written before
+/// recording existed) detects nothing rather than everything.
+pub(crate) fn lingering_removed_files(
+    recorded: &[String],
+    source: &Path,
+    copy: &Path,
+) -> Vec<PathBuf> {
+    let mut lingering: Vec<PathBuf> = recorded
+        .iter()
+        .map(PathBuf::from)
+        .filter(|rel| !source.join(rel).exists() && copy.join(rel).exists())
+        .collect();
+    lingering.sort();
+    lingering
 }
 
 /// Human-readable list of diverged relative paths for a condition reason:

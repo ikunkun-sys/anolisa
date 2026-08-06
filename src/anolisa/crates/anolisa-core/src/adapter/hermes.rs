@@ -28,7 +28,7 @@ use super::driver::{
     ClaimResourceRef, ConditionStatus, DetectResult, DisableReport, DriverCtx, DriverPlan,
     FrameworkCommand, FrameworkDriver, HostEnv, PreparedEnable, find_binary_in_path,
 };
-use super::util::{copy_divergence, display_paths};
+use super::util::{copy_divergence, delivered_files, display_paths, lingering_removed_files};
 
 /// Default timeout for a Hermes CLI invocation.
 const CLI_TIMEOUT: Duration = Duration::from_secs(60);
@@ -195,6 +195,23 @@ impl FrameworkDriver for HermesDriver {
             Some(plugin_id)
         };
 
+        // Record the projection the plugin copy will actually receive
+        // (bundle minus `skills/`), so status can detect delivered files
+        // the source later stops shipping. Skill-only receipts copy no
+        // plugin tree and record nothing.
+        let delivered_paths = if ctx.is_skill_bundle() {
+            Vec::new()
+        } else {
+            delivered_files(&bundle.resource_root, &["skills"])
+                .map_err(|source| AdapterError::Io {
+                    path: bundle.resource_root.clone(),
+                    source,
+                })?
+                .iter()
+                .map(|rel| rel.to_string_lossy().into_owned())
+                .collect()
+        };
+
         let mut skill_resource_ids = Vec::new();
         for skill in &ctx.declared_skills {
             let res_id = format!("hermes_skill_{}", skill.name);
@@ -231,6 +248,7 @@ impl FrameworkDriver for HermesDriver {
                         RES_PLUGIN.to_string()
                     },
                     skill_resources: skill_resource_ids,
+                    delivered_paths,
                 }),
             },
             PreparedEnable::None,
@@ -254,6 +272,12 @@ impl FrameworkDriver for HermesDriver {
             validate_plugin_id(&plugin_id)?;
 
             let plugin_dest = home.join("plugins").join(&plugin_id);
+            // Replace any prior contents so a re-enable after a bundle
+            // change does not leave stale files behind (same rationale as
+            // cosh). The dir is the receipt-declared plugin resource that
+            // disable already removes wholesale, so remove_tree claims no
+            // new authority.
+            ctx.ops.remove_tree(&plugin_dest)?;
             copy_bundle_excluding_skills(&claim.resource_root, &plugin_dest, ctx)?;
 
             let enable_cmd = build_enable_cmd(&plugin_id);
@@ -312,15 +336,29 @@ impl FrameworkDriver for HermesDriver {
                     ConditionStatus::False,
                     Some("hermes plugin directory missing".to_string()),
                 ),
-                Some(dir) => match copy_divergence(&ctx.resource_root, &dir) {
-                    Ok(diverged) if diverged.is_empty() => (ConditionStatus::True, None),
-                    Ok(diverged) => (
-                        ConditionStatus::False,
-                        Some(format!(
-                            "copied plugin differs from the delivered source ({}); re-enable to refresh",
-                            display_paths(&diverged),
-                        )),
-                    ),
+                // The plugin copy receives the bundle minus `skills/`
+                // (delivered separately); compare exactly that projection.
+                Some(dir) => match copy_divergence(&ctx.resource_root, &dir, &["skills"]) {
+                    Ok(mut diverged) => {
+                        diverged.extend(lingering_removed_files(
+                            claim_delivered_paths(claim),
+                            &ctx.resource_root,
+                            &dir,
+                        ));
+                        diverged.sort();
+                        diverged.dedup();
+                        if diverged.is_empty() {
+                            (ConditionStatus::True, None)
+                        } else {
+                            (
+                                ConditionStatus::False,
+                                Some(format!(
+                                    "copied plugin differs from the delivered source ({}); re-enable to refresh",
+                                    display_paths(&diverged),
+                                )),
+                            )
+                        }
+                    }
                     Err(err) => (
                         ConditionStatus::Unknown,
                         Some(format!(
@@ -751,6 +789,15 @@ fn claim_plugin_dir(claim: &AdapterClaim) -> Option<PathBuf> {
         ClaimResourceKind::ExternalPath { path } => Some(path.clone()),
         _ => None,
     })
+}
+
+/// Enable-time delivered file list from the receipt payload. Empty for
+/// receipts written before recording existed (or non-hermes payloads).
+fn claim_delivered_paths(claim: &AdapterClaim) -> &[String] {
+    match &claim.driver_payload {
+        DriverPayload::Hermes(payload) => &payload.delivered_paths,
+        _ => &[],
+    }
 }
 
 /// Plugin id from a bundle, or [`AdapterError::BundleInvalid`] when none
